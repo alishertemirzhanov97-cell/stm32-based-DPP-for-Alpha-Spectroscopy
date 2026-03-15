@@ -18,3 +18,49 @@ Applications:
 • Gamma spectroscopy
 • Educational nuclear instrumentation
 • Low-cost laboratory spectrometers
+
+# STM32 Firmware
+
+This firmware implements a digital multichannel analyzer (MCA) using an STM32 microcontroller.
+
+Functions:
+
+- ADC acquisition using DMA
+- recursive trapezoidal digital filter
+- peak detection
+- USB CDC transmission of event energies
+
+## Build
+
+1. Open project in STM32CubeIDE
+2. Build
+3. Flash to STM32 board
+4. Connect USB
+
+## Commands
+
+The firmware supports runtime parameter control:
+
+TRIG <value>  
+END <value>  
+KGAP <value>  
+LFLAT <value>  
+MPZ <value>  
+DPP <kgap> <lflat> <mpz>
+
+# Python MCA DAQ
+
+Python program for acquiring and displaying spectra from the STM32 MCA.
+
+Features:
+
+- real-time histogram display
+- adjustable spectrum range
+- DPP parameter control
+- data saving
+
+## Install
+
+py-charm
+
+## Run
