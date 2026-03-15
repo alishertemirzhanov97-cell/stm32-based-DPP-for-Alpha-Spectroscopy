@@ -1,0 +1,527 @@
+import sys
+import time
+import numpy as np
+import serial
+import serial.tools.list_ports
+
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal, Qt
+from PyQt6.QtGui import QIntValidator
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QComboBox, QFileDialog, QFrame,
+    QLineEdit, QSpinBox
+)
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+
+CSS_THEME = """
+QMainWindow {
+    background-color: #ffffff;
+}
+
+QFrame#Sidebar {
+    background-color: #f8f9fa;
+    border-right: 1px solid #e0e0e0;
+    min-width: 260px;
+    max-width: 300px;
+}
+
+QFrame#StatusBar {
+    background-color: #ffffff;
+    border-top: 1px solid #e0e0e0;
+    min-height: 56px;
+}
+
+QLabel#SectionHeader {
+    font-size: 13px;
+    font-weight: bold;
+    color: #555;
+    margin-top: 15px;
+    margin-bottom: 5px;
+    text-transform: uppercase;
+}
+
+QLabel#SmallNote {
+    color: #666;
+    font-size: 11px;
+}
+
+QPushButton {
+    background-color: #007bff;
+    color: white;
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-weight: bold;
+    border: none;
+    font-size: 13px;
+    min-height: 22px;
+    margin-bottom: 6px;
+}
+
+QPushButton:hover {
+    background-color: #0069d9;
+}
+
+QPushButton#Secondary {
+    background-color: #ffffff;
+    color: #007bff;
+    border: 1px solid #007bff;
+}
+
+QPushButton#Secondary:hover {
+    background-color: #f0f7ff;
+}
+
+QPushButton#Danger {
+    background-color: #dc3545;
+}
+
+QPushButton#Danger:hover {
+    background-color: #c82333;
+}
+
+QComboBox, QLineEdit, QSpinBox {
+    border: 1px solid #ced4da;
+    border-radius: 4px;
+    background-color: white;
+    font-size: 13px;
+    min-height: 22px;
+    padding: 4px 8px;
+    margin-bottom: 10px;
+}
+
+QComboBox::drop-down {
+    width: 24px;
+    border: none;
+}
+
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 18px;
+}
+
+QSpinBox::up-arrow, QSpinBox::down-arrow,
+QComboBox::down-arrow {
+    width: 10px;
+    height: 10px;
+}
+"""
+
+
+class SerialWorker(QThread):
+    data_received = pyqtSignal(np.ndarray, int)
+    status = pyqtSignal(str)
+
+    def __init__(self, port: str, channels: int):
+        super().__init__()
+        self.port = port
+        self.channels = channels
+        self._running = True
+        self._ser = None
+        self._pending_cmds = []
+
+    def queue_command(self, cmd: str):
+        self._pending_cmds.append((cmd.strip() + "\n").encode("ascii"))
+
+    def queue_thresholds(self, trig: int, end: int):
+        if end >= trig:
+            end = int(0.4 * trig)
+        self.queue_command(f"THR {int(trig)} {int(end)}")
+
+    def queue_dpp(self, kgap: int, lflat: int, mpz_x1000: int):
+        self.queue_command(f"DPP {int(kgap)} {int(lflat)} {int(mpz_x1000)}")
+
+    def run(self):
+        try:
+            self._ser = serial.Serial(self.port, 115200, timeout=0.05)
+            self.status.emit(f"Opened {self.port}")
+
+            while self._running:
+                while self._pending_cmds:
+                    cmd = self._pending_cmds.pop(0)
+                    try:
+                        self._ser.write(cmd)
+                        self._ser.flush()
+                        self.status.emit(f"Sent: {cmd.decode('ascii').strip()}")
+                    except Exception as e:
+                        self.status.emit(f"TX error: {e}")
+
+                n = self._ser.in_waiting
+                if n >= 2:
+                    chunk = self._ser.read((n // 2) * 2)
+                    if not chunk:
+                        time.sleep(0.002)
+                        continue
+
+                    arr = np.frombuffer(chunk, dtype="<u2")
+                    arr = arr[arr < self.channels]
+                    if arr.size > 0:
+                        hist = np.bincount(arr, minlength=self.channels)
+                        self.data_received.emit(hist, int(arr.size))
+                else:
+                    time.sleep(0.005)
+
+        except Exception as e:
+            self.status.emit(f"Serial error: {e}")
+        finally:
+            try:
+                if self._ser:
+                    self._ser.close()
+            except Exception:
+                pass
+            self.status.emit("Closed")
+
+    def stop(self):
+        self._running = False
+        self.wait()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Gamma MCA - Spectroscopy Analyzer")
+        self.resize(1280, 800)
+        self.setStyleSheet(CSS_THEME)
+
+        self.channels = 65536
+        self.hist_data = np.zeros(self.channels, dtype=np.float64)
+        self.total_counts = 0
+        self.worker = None
+
+        self._last_total = 0
+        self._last_t = time.time()
+        self._cps = 0.0
+        self._fill = None
+
+        self.view_xmin = 0
+        self.view_xmax = self.channels - 1
+
+        self.init_ui()
+
+    def init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        top_hbox = QHBoxLayout()
+        top_hbox.setSpacing(0)
+
+        sidebar = QFrame()
+        sidebar.setObjectName("Sidebar")
+        side_vbox = QVBoxLayout(sidebar)
+        side_vbox.setContentsMargins(15, 15, 15, 15)
+
+        side_vbox.addWidget(QLabel("Device Control", objectName="SectionHeader"))
+
+        self.port_combo = QComboBox()
+        self.refresh_ports()
+        side_vbox.addWidget(self.port_combo)
+
+        self.btn_refresh_ports = QPushButton("Refresh Ports", objectName="Secondary")
+        self.btn_refresh_ports.clicked.connect(self.refresh_ports)
+        side_vbox.addWidget(self.btn_refresh_ports)
+
+        self.btn_conn = QPushButton("Serial Connection")
+        self.btn_conn.clicked.connect(self.toggle_connection)
+        side_vbox.addWidget(self.btn_conn)
+
+        side_vbox.addWidget(QLabel("Channel Range", objectName="SectionHeader"))
+
+        self.xmin_spin = QSpinBox()
+        self.xmin_spin.setRange(0, self.channels - 1)
+        self.xmin_spin.setValue(0)
+
+        self.xmax_spin = QSpinBox()
+        self.xmax_spin.setRange(0, self.channels - 1)
+        self.xmax_spin.setValue(self.channels - 1)
+
+        side_vbox.addWidget(QLabel("X min", objectName="SmallNote"))
+        side_vbox.addWidget(self.xmin_spin)
+        side_vbox.addWidget(QLabel("X max", objectName="SmallNote"))
+        side_vbox.addWidget(self.xmax_spin)
+
+        self.btn_apply_range = QPushButton("Apply Range", objectName="Secondary")
+        self.btn_apply_range.clicked.connect(self.apply_range)
+        side_vbox.addWidget(self.btn_apply_range)
+
+        side_vbox.addWidget(QLabel("DPP Thresholds", objectName="SectionHeader"))
+
+        self.trig_spin = QSpinBox()
+        self.trig_spin.setRange(1, 1000000)
+        self.trig_spin.setValue(900)
+
+        self.end_spin = QSpinBox()
+        self.end_spin.setRange(0, 1000000)
+        self.end_spin.setValue(100)
+
+        side_vbox.addWidget(QLabel("TRIG (start)", objectName="SmallNote"))
+        side_vbox.addWidget(self.trig_spin)
+        side_vbox.addWidget(QLabel("END (stop)", objectName="SmallNote"))
+        side_vbox.addWidget(self.end_spin)
+
+        self.btn_apply_thr = QPushButton("Apply Thresholds", objectName="Secondary")
+        self.btn_apply_thr.clicked.connect(self.apply_thresholds)
+        side_vbox.addWidget(self.btn_apply_thr)
+
+        side_vbox.addWidget(QLabel("DPP Parameters", objectName="SectionHeader"))
+
+        self.kgap_spin = QSpinBox()
+        self.kgap_spin.setRange(1, 255)
+        self.kgap_spin.setValue(16)
+
+        self.lflat_spin = QSpinBox()
+        self.lflat_spin.setRange(0, 255)
+        self.lflat_spin.setValue(4)
+
+        self.mpz_spin = QSpinBox()
+        self.mpz_spin.setRange(-1000, 1000)
+        self.mpz_spin.setValue(1)
+
+        side_vbox.addWidget(QLabel("KGAP", objectName="SmallNote"))
+        side_vbox.addWidget(self.kgap_spin)
+        side_vbox.addWidget(QLabel("LFLAT", objectName="SmallNote"))
+        side_vbox.addWidget(self.lflat_spin)
+        side_vbox.addWidget(QLabel("MPZ x1000", objectName="SmallNote"))
+        side_vbox.addWidget(self.mpz_spin)
+
+        self.btn_apply_dpp = QPushButton("Apply DPP", objectName="Secondary")
+        self.btn_apply_dpp.clicked.connect(self.apply_dpp)
+        side_vbox.addWidget(self.btn_apply_dpp)
+
+        self.lbl_status = QLabel("Status: idle")
+        self.lbl_status.setStyleSheet("color:#666; font-family: monospace;")
+        self.lbl_status.setWordWrap(True)
+        side_vbox.addWidget(self.lbl_status)
+
+        side_vbox.addWidget(QLabel("File Management", objectName="SectionHeader"))
+
+        btn_save = QPushButton("Save Spectrum", objectName="Secondary")
+        btn_save.clicked.connect(self.save_csv)
+        side_vbox.addWidget(btn_save)
+
+        btn_clear = QPushButton("Clear Data", objectName="Danger")
+        btn_clear.clicked.connect(self.clear_data)
+        side_vbox.addWidget(btn_clear)
+
+        side_vbox.addStretch()
+
+        self.lbl_stats = QLabel("Total: 0 cts\nRate: 0.0 CPS\nMax: 0")
+        self.lbl_stats.setStyleSheet("color: #666; font-family: monospace; line-height: 150%;")
+        side_vbox.addWidget(self.lbl_stats)
+
+        top_hbox.addWidget(sidebar)
+
+        content = QWidget()
+        content_vbox = QVBoxLayout(content)
+        content_vbox.setContentsMargins(30, 20, 30, 20)
+
+        title = QLabel("Energy Spectrum")
+        title.setStyleSheet("font-size: 20px; color: #333; font-weight: 400;")
+        content_vbox.addWidget(title)
+
+        self.fig = Figure(facecolor="#ffffff", tight_layout=True)
+        self.canvas = FigureCanvas(self.fig)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor("#ffffff")
+        self.ax.set_xlabel("Bin [1]", fontsize=9, color="#666")
+        self.ax.set_ylabel("Counts [1]", fontsize=9, color="#666")
+        self.ax.spines["top"].set_visible(False)
+        self.ax.spines["right"].set_visible(False)
+        self.ax.grid(True, axis="y", linestyle="-", alpha=0.1)
+
+        self.x = np.arange(self.channels)
+        (self.line,) = self.ax.step(self.x, self.hist_data, where="mid", lw=1)
+        self._fill = self.ax.fill_between(self.x, self.hist_data, step="mid", alpha=0.3)
+
+        self.ax.set_xlim(self.view_xmin, self.view_xmax)
+        self.ax.set_ylim(0, 10)
+
+        content_vbox.addWidget(self.canvas)
+        top_hbox.addWidget(content, 1)
+
+        layout.addLayout(top_hbox, 1)
+
+        status_bar = QFrame()
+        status_bar.setObjectName("StatusBar")
+        status_hbox = QHBoxLayout(status_bar)
+
+        btn_linear = QPushButton("Y: Linear", objectName="Secondary")
+        btn_linear.setFixedWidth(100)
+        btn_linear.clicked.connect(lambda: self.set_scale(False))
+
+        btn_log = QPushButton("Y: Log", objectName="Secondary")
+        btn_log.setFixedWidth(100)
+        btn_log.clicked.connect(lambda: self.set_scale(True))
+
+        status_hbox.addWidget(btn_linear)
+        status_hbox.addWidget(btn_log)
+        status_hbox.addStretch()
+
+        layout.addWidget(status_bar)
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.refresh_ui)
+        self.timer.start(300)
+
+    def refresh_ports(self):
+        current = self.port_combo.currentText()
+        self.port_combo.clear()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port_combo.addItems(ports)
+        if current and current in ports:
+            self.port_combo.setCurrentText(current)
+
+    def toggle_connection(self):
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker = None
+            self.btn_conn.setText("Serial Connection")
+            self.btn_conn.setStyleSheet("")
+            self.lbl_status.setText("Status: disconnected")
+            return
+
+        port = self.port_combo.currentText().strip()
+        if not port:
+            self.lbl_status.setText("Status: no COM port selected")
+            return
+
+        self.worker = SerialWorker(port, self.channels)
+        self.worker.data_received.connect(self.on_data)
+        self.worker.status.connect(self.on_worker_status)
+        self.worker.start()
+
+        self.btn_conn.setText("Connected")
+        self.btn_conn.setStyleSheet("background-color: #28a745;")
+        self.lbl_status.setText(f"Status: connecting to {port}")
+
+    def on_worker_status(self, msg: str):
+        self.lbl_status.setText(f"Status: {msg}")
+        if msg == "Closed" and self.worker is not None:
+            self.worker = None
+            self.btn_conn.setText("Serial Connection")
+            self.btn_conn.setStyleSheet("")
+
+    def apply_thresholds(self):
+        if self.worker is None:
+            self.lbl_status.setText("Status: not connected")
+            return
+
+        trig = int(self.trig_spin.value())
+        end = int(self.end_spin.value())
+
+        if end >= trig:
+            end = int(0.4 * trig)
+            self.end_spin.setValue(end)
+            self.lbl_status.setText(f"Status: END adjusted to {end} (< TRIG)")
+
+        self.worker.queue_thresholds(trig, end)
+
+    def apply_dpp(self):
+        if self.worker is None:
+            self.lbl_status.setText("Status: not connected")
+            return
+
+        kgap = int(self.kgap_spin.value())
+        lflat = int(self.lflat_spin.value())
+        mpz_x1000 = int(self.mpz_spin.value())
+        self.worker.queue_dpp(kgap, lflat, mpz_x1000)
+
+    def apply_range(self):
+        xmin = int(self.xmin_spin.value())
+        xmax = int(self.xmax_spin.value())
+
+        if xmin > xmax:
+            xmin, xmax = xmax, xmin
+            self.xmin_spin.setValue(xmin)
+            self.xmax_spin.setValue(xmax)
+
+        self.view_xmin = xmin
+        self.view_xmax = xmax
+        self.ax.set_xlim(self.view_xmin, self.view_xmax)
+        self.canvas.draw_idle()
+
+    def on_data(self, counts: np.ndarray, size: int):
+        self.hist_data += counts
+        self.total_counts += size
+
+    def set_scale(self, is_log: bool):
+        if is_log:
+            self.ax.set_yscale("log")
+            ymax = float(np.max(self.hist_data[self.view_xmin:self.view_xmax + 1]))
+            self.ax.set_ylim(0.1, max(10, ymax * 1.2))
+        else:
+            self.ax.set_yscale("linear")
+            ymax = float(np.max(self.hist_data[self.view_xmin:self.view_xmax + 1]))
+            self.ax.set_ylim(0, max(10, ymax * 1.1))
+        self.canvas.draw_idle()
+
+    def refresh_ui(self):
+        t = time.time()
+        dt = t - self._last_t
+        if dt >= 0.5:
+            dN = self.total_counts - self._last_total
+            self._cps = dN / dt if dt > 0 else 0.0
+            self._last_total = self.total_counts
+            self._last_t = t
+
+        self.line.set_ydata(self.hist_data)
+
+        if self._fill is not None:
+            self._fill.remove()
+        self._fill = self.ax.fill_between(self.x, self.hist_data, step="mid", alpha=0.3)
+
+        self.ax.set_xlim(self.view_xmin, self.view_xmax)
+
+        data_view = self.hist_data[self.view_xmin:self.view_xmax + 1]
+        ymax = float(np.max(data_view)) if data_view.size > 0 else 0.0
+
+        if self.ax.get_yscale() == "linear":
+            self.ax.set_ylim(0, max(10, ymax * 1.1))
+        else:
+            self.ax.set_ylim(0.1, max(10, ymax * 1.2))
+
+        self.lbl_stats.setText(
+            f"Total: {self.total_counts:,} cts\n"
+            f"Rate: {self._cps:,.1f} CPS\n"
+            f"Max: {int(np.max(self.hist_data))} cts"
+        )
+
+        self.canvas.draw_idle()
+
+    def clear_data(self):
+        self.hist_data.fill(0)
+        self.total_counts = 0
+        self._last_total = 0
+        self._last_t = time.time()
+        self._cps = 0.0
+        self.refresh_ui()
+
+    def save_csv(self):
+        fn, _ = QFileDialog.getSaveFileName(self, "Save Data", "", "CSV Files (*.csv)")
+        if not fn:
+            return
+
+        xmin, xmax = self.view_xmin, self.view_xmax
+        x = np.arange(xmin, xmax + 1)
+        y = self.hist_data[xmin:xmax + 1].astype(np.int64)
+        data = np.column_stack((x, y))
+        np.savetxt(fn, data, delimiter=",", header="bin,counts", comments="")
+        self.lbl_status.setText(f"Status: saved {fn}")
+
+    def closeEvent(self, event):
+        if self.worker is not None:
+            self.worker.stop()
+        super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
