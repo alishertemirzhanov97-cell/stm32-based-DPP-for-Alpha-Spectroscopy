@@ -1,10 +1,10 @@
 # STM32 Digital Multichannel Analyzer (MCA)
 
-A low-cost digital spectroscopy system based on STM32 microcontrollers 
-for alpha and gamma radiation detection.
+A low-cost digital spectroscopy system based on STM32 microcontrollers for alpha and gamma radiation detection.
 
-The system implements real-time digital pulse processing (DPP) 
-using a recursive trapezoidal filter and peak detection algorithm.
+The system implements real-time digital pulse processing (DPP) using a recursive trapezoidal filter and peak detection algorithm. It directly digitizes preamplifier signals and performs on-device signal shaping, energy extraction, and data streaming via USB.
+
+This project is designed with accessibility in mind, aiming to provide an affordable alternative to traditional spectroscopy systems. Future developments include the design of a low-cost charge-sensitive preamplifier and the use of inexpensive photodiodes such as BPX61 photodiode and BPW21R photodiode to significantly reduce system cost and enable wider adoption in educational and research environments.
 
 Features:
 • Real-time trapezoidal digital filter
