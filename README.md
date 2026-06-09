@@ -40,7 +40,8 @@ Functions:
 ## Commands
 
 The firmware supports runtime parameter control:
-
+THR 200 80
+DPP 16 4 1
 TRIG <value>  
 END <value>  
 KGAP <value>  
